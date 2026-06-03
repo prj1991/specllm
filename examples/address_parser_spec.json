@@ -1,0 +1,40 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Address Parser API", "version": "1.0.0" },
+  "paths": {
+    "/v1/parse-address": {
+      "post": {
+        "description": "Extract the city name and pincode (postal/zip code) from a plaintext address.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["address"],
+                "properties": {
+                  "address": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["city", "pincode"],
+                  "properties": {
+                    "city": { "type": "string" },
+                    "pincode": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
