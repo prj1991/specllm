@@ -7,7 +7,7 @@ You define a REST API spec. specllm turns it into a live service where every res
 ```
 ┌──────────┐       ┌─────────────────────────────────────┐       ┌─────────┐
 │ Your App │──────▶│ specllm                             │──────▶│   LLM   │
-│          │◀──────│ (validates, retries, caches, serves) │◀──────│(any LLM)│
+│          │◀──────│ (validates, retries, caches, serves)│◀──────│(any LLM)│
 └──────────┘ JSON  └─────────────────────────────────────┘ JSON  └─────────┘
 ```
 
