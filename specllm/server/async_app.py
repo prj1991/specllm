@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any
 
-from specllm.observability.headers import build_headers
+from specllm.server.app import _build_headers
 
 
 class AsyncSpecLLMServer:
@@ -78,10 +78,8 @@ class AsyncSpecLLMServer:
         if "error" in result:
             status = result["error"].get("status", 500)
 
-        headers = build_headers(
+        headers = _build_headers(
             request_id=request_id,
-            provider="default",
-            model=self.app.model or "default",
             latency_ms=latency_ms,
             tokens_used=metadata.get("tokens_used", 0),
             retries=metadata.get("retries", 0),

@@ -1,7 +1,7 @@
 """OpenAPI JSON spec parser."""
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
@@ -14,7 +14,6 @@ class Endpoint:
     description: str
     request_schema: Optional[Dict] = None
     response_schema: Optional[Dict] = None
-    parameters: List[Dict] = field(default_factory=list)
 
 
 def _resolve_refs(schema: Any, root_spec: dict) -> Any:
@@ -55,7 +54,6 @@ def parse_openapi_spec(spec: dict) -> List[Endpoint]:
                 continue
 
             description: str = operation.get("description", "")
-            parameters: List[Dict] = operation.get("parameters", [])
 
             request_schema: Optional[Dict] = None
             request_body = operation.get("requestBody")
@@ -86,7 +84,6 @@ def parse_openapi_spec(spec: dict) -> List[Endpoint]:
                     description=description,
                     request_schema=request_schema,
                     response_schema=response_schema,
-                    parameters=parameters,
                 )
             )
 

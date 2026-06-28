@@ -1,27 +1,78 @@
 """Request pipeline - orchestrates the full request flow."""
 
+import datetime
 import json
 import uuid
 import concurrent.futures
 from typing import Callable, Dict, Optional
 
 from specllm.pipeline.cache import Cache
-from specllm.spec.validator import validate_schema, ValidationError
-from specllm.spec.parser import Endpoint
-from specllm.prompts.generator import generate_prompt
-from specllm.pipeline.retry import RetryHandler, MaxRetriesExceeded
 from specllm.pipeline.constraints import resolve_constraints
-from specllm.errors.codes import build_error_response, ErrorCode
+from specllm.spec.parser import Endpoint
+from specllm.spec.validator import validate_schema, ValidationError
+
+# --- Error codes ---
+
+_STATUS = {
+    "INPUT_VALIDATION_FAILED": 400,
+    "OUTPUT_SCHEMA_VIOLATION": 422,
+    "PROVIDER_TIMEOUT": 504,
+    "PROVIDER_UNAVAILABLE": 503,
+    "COST_LIMIT_REACHED": 503,
+}
 
 
-class ProviderError(Exception):
-    """Raised when an LLM provider call fails."""
+def _error(code: str, message: str, request_id: str) -> dict:
+    return {"error": {
+        "code": code,
+        "status": _STATUS.get(code, 500),
+        "message": message,
+        "request_id": request_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }}
 
+
+# --- Prompt generation ---
+
+def _build_prompt(endpoint: Endpoint, request_body: dict, response_schema: Optional[dict]) -> str:
+    parts = []
+    if endpoint.description:
+        parts.append(f"Task: {endpoint.description}\n")
+    parts.append("You must respond with valid JSON matching the following schema:\n")
+    schema = response_schema or endpoint.response_schema
+    if schema:
+        parts.append(json.dumps(schema, indent=2))
+    if request_body:
+        parts.append(f"\nRequest body:\n{json.dumps(request_body, indent=2)}")
+    return "\n".join(parts)
+
+
+# --- Retry with feedback ---
+
+class _MaxRetries(Exception):
     pass
 
 
+def _retry(call_fn: Callable, validate_fn: Callable, max_retries: int) -> dict:
+    result = call_fn(None)
+    errors = validate_fn(result)
+    if not errors:
+        return result
+    for _ in range(max_retries):
+        feedback = "Your previous response failed schema validation:\n"
+        feedback += "\n".join(f"- {e.path}: {e.message}" for e in errors)
+        feedback += "\nPlease respond with valid JSON."
+        result = call_fn(feedback)
+        errors = validate_fn(result)
+        if not errors:
+            return result
+    raise _MaxRetries()
+
+
+# --- Pipeline ---
+
 class RequestPipeline:
-    """Orchestrates request handling: validate, cache, call LLM, validate output."""
+    """Orchestrates: validate → constrain → cache → prompt → LLM → validate → retry."""
 
     def __init__(
         self,
@@ -40,143 +91,112 @@ class RequestPipeline:
         self.max_retries = max_retries
         self.timeout_seconds = timeout_seconds
         self.cache = Cache(default_ttl=cache_ttl)
-        self.retry_handler = RetryHandler(max_retries=max_retries)
-        self.custom_prompts: Dict[tuple, Callable] = custom_prompts if custom_prompts is not None else {}
-        self.custom_validators: Dict[tuple, Callable] = custom_validators if custom_validators is not None else {}
+        self.custom_prompts = custom_prompts if custom_prompts is not None else {}
+        self.custom_validators = custom_validators if custom_validators is not None else {}
         self.cost_tracker = cost_tracker
-        self.endpoint_models: Dict[str, str] = endpoint_models or {}
-        self.last_metadata: dict = {"retries": 0, "cache_hit": False, "tokens_used": 0}
+        self.endpoint_models = endpoint_models or {}
+        self.last_metadata: dict = {}
 
     def _call_provider(self, provider: object, prompt: str) -> dict:
-        """Call a provider with timeout enforcement."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(provider.call, prompt)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             try:
-                result = future.result(timeout=self.timeout_seconds)
+                result = ex.submit(provider.call, prompt).result(timeout=self.timeout_seconds)
             except concurrent.futures.TimeoutError:
                 raise TimeoutError(f"LLM call timed out after {self.timeout_seconds}s")
         if not isinstance(result, dict):
-            return {"__specllm_invalid__": True, "__raw__": str(result)[:500]}
+            return {"__specllm_invalid__": True}
         return result
 
-    def _handle_failure(
-        self, code: ErrorCode, message: str,
-        prompt: str, validate_fn: Callable, cache_key: str, call_count: int, request_id: str,
-    ) -> dict:
-        """Try fallback, otherwise return structured error."""
-        if self.fallback_provider:
-            try:
-                result = self._call_provider(self.fallback_provider, prompt)
-                if not validate_fn(result):
-                    self.last_metadata["retries"] = call_count
-                    self.cache.set(cache_key, result)
-                    return result
-            except Exception:
-                pass
+    def _try_fallback(self, prompt: str, validate_fn: Callable, cache_key: str) -> Optional[dict]:
+        if not self.fallback_provider:
+            return None
+        try:
+            result = self._call_provider(self.fallback_provider, prompt)
+            if not validate_fn(result):
+                self.cache.set(cache_key, result)
+                return result
+        except Exception:
+            pass
+        return None
+
+    def _fail(self, code, message, prompt, validate_fn, cache_key, call_count, request_id):
+        fb = self._try_fallback(prompt, validate_fn, cache_key)
+        if fb:
+            return fb
         self.last_metadata["retries"] = max(0, call_count - 1)
-        return build_error_response(code, message=message, request_id=request_id)
+        return _error(code, message, request_id)
 
     def handle(self, endpoint: Endpoint, request_body: dict) -> dict:
-        """Handle a request through the full pipeline."""
         request_id = str(uuid.uuid4())
         self.last_metadata = {"retries": 0, "cache_hit": False, "tokens_used": 0}
 
-        # Cost limit check
+        # Cost limit
         if self.cost_tracker and not self.cost_tracker.check_limit():
-            return build_error_response(
-                ErrorCode.COST_LIMIT_REACHED,
-                message="Daily cost limit reached. Requests are paused until the next day.",
-                request_id=request_id,
-            )
+            return _error("COST_LIMIT_REACHED", "Daily cost limit reached.", request_id)
 
-        # Validate input (schema)
+        # Input validation (schema)
         if endpoint.request_schema:
-            input_errors = validate_schema(request_body, endpoint.request_schema)
-            if input_errors:
-                return build_error_response(
-                    ErrorCode.INPUT_VALIDATION_FAILED,
-                    message="; ".join(e.message for e in input_errors),
-                    request_id=request_id,
-                )
+            errors = validate_schema(request_body, endpoint.request_schema)
+            if errors:
+                return _error("INPUT_VALIDATION_FAILED", "; ".join(e.message for e in errors), request_id)
 
-        # Validate input (custom business rules)
-        custom_validator = self.custom_validators.get((endpoint.path, endpoint.method))
-        if custom_validator:
-            rejection = custom_validator(request_body)
+        # Input validation (custom)
+        validator = self.custom_validators.get((endpoint.path, endpoint.method))
+        if validator:
+            rejection = validator(request_body)
             if rejection:
-                return build_error_response(
-                    ErrorCode.INPUT_VALIDATION_FAILED,
-                    message=str(rejection),
-                    request_id=request_id,
-                )
+                return _error("INPUT_VALIDATION_FAILED", str(rejection), request_id)
 
-        # Apply dynamic constraints from request body (x-constrain-from in spec)
-        constrained_response_schema = resolve_constraints(endpoint.response_schema, request_body)
+        # Resolve dynamic constraints
+        response_schema = resolve_constraints(endpoint.response_schema, request_body)
 
-        # Check cache
+        # Cache
         cache_key = self.cache.generate_key(endpoint.path, endpoint.method, request_body)
         cached = self.cache.get(cache_key)
         if cached is not None:
             self.last_metadata["cache_hit"] = True
             return cached
 
-        # Build prompt
-        custom_prompt_fn = self.custom_prompts.get((endpoint.path, endpoint.method))
-        if custom_prompt_fn:
-            prompt = custom_prompt_fn(request_body)
-        else:
-            prompt = generate_prompt(endpoint, request_body, constrained_response_schema)
+        # Prompt
+        prompt_fn = self.custom_prompts.get((endpoint.path, endpoint.method))
+        prompt = prompt_fn(request_body) if prompt_fn else _build_prompt(endpoint, request_body, response_schema)
 
-        # Determine which provider to use (per-endpoint model override)
+        # Provider selection
         active_provider = self.provider
-        endpoint_model = self.endpoint_models.get(endpoint.path)
-        if endpoint_model and hasattr(self.provider, "with_model"):
-            active_provider = self.provider.with_model(endpoint_model)
+        model = self.endpoint_models.get(endpoint.path)
+        if model and hasattr(self.provider, "with_model"):
+            active_provider = self.provider.with_model(model)
 
+        # Call LLM with retry
         call_count = 0
 
         def call_fn(feedback: Optional[str] = None) -> dict:
             nonlocal call_count
             call_count += 1
-            actual_prompt = prompt + "\n\n" + feedback if feedback else prompt
-            return self._call_provider(active_provider, actual_prompt)
+            p = prompt + "\n\n" + feedback if feedback else prompt
+            return self._call_provider(active_provider, p)
 
         def validate_fn(result: dict) -> list:
             if result.get("__specllm_invalid__"):
-                return [ValidationError(
-                    path=".", message="Response must be a JSON object. Got non-JSON output from provider."
-                )]
-            if constrained_response_schema:
-                return validate_schema(result, constrained_response_schema)
-            return []
+                return [ValidationError(path=".", message="Non-JSON output from provider.")]
+            return validate_schema(result, response_schema) if response_schema else []
 
         try:
-            result = self.retry_handler.execute(call_fn, validate_fn)
-        except MaxRetriesExceeded:
-            return self._handle_failure(
-                ErrorCode.OUTPUT_SCHEMA_VIOLATION,
-                "LLM output failed schema validation after all retries",
-                prompt, validate_fn, cache_key, call_count, request_id,
-            )
+            result = _retry(call_fn, validate_fn, self.max_retries)
+        except _MaxRetries:
+            return self._fail("OUTPUT_SCHEMA_VIOLATION", "LLM output failed validation after retries",
+                             prompt, validate_fn, cache_key, call_count, request_id)
         except TimeoutError as e:
-            return self._handle_failure(
-                ErrorCode.PROVIDER_TIMEOUT, str(e),
-                prompt, validate_fn, cache_key, call_count, request_id,
-            )
+            return self._fail("PROVIDER_TIMEOUT", str(e), prompt, validate_fn, cache_key, call_count, request_id)
         except Exception as e:
-            return self._handle_failure(
-                ErrorCode.PROVIDER_UNAVAILABLE, f"LLM provider error: {e}",
-                prompt, validate_fn, cache_key, call_count, request_id,
-            )
+            return self._fail("PROVIDER_UNAVAILABLE", f"LLM provider error: {e}",
+                             prompt, validate_fn, cache_key, call_count, request_id)
 
         self.last_metadata["retries"] = max(0, call_count - 1)
-
-        # Track cost
         if self.cost_tracker:
-            # Estimate tokens from prompt + response (rough: 4 chars ≈ 1 token)
-            estimated_tokens = (len(prompt) + len(json.dumps(result))) // 4
-            self.cost_tracker.record(estimated_tokens)
-            self.last_metadata["tokens_used"] = estimated_tokens
+            tokens = (len(prompt) + len(json.dumps(result))) // 4
+            self.cost_tracker.record(tokens)
+            self.last_metadata["tokens_used"] = tokens
 
         self.cache.set(cache_key, result)
         return result

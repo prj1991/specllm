@@ -379,7 +379,8 @@ class TestEndToEndHTTPServer:
         provider = MockProvider(responses=[
             {"team": "support", "priority": 2, "tags": ["account"]},
         ])
-        self.server = SpecLLMServer(spec=SPEC, provider=provider, host="127.0.0.1", port=0)
+        app = SpecLLM(spec=SPEC, provider=provider)
+        self.server = SpecLLMServer(app=app, host="127.0.0.1", port=0)
         self.port = self.server.port
         self.thread = threading.Thread(target=self.server.serve, daemon=True)
         self.thread.start()
@@ -552,33 +553,6 @@ class TestEndToEndRecordReplay:
         with pytest.raises(RuntimeError, match="No recording found"):
             replayer.call("unknown prompt")
 
-
-class TestEndToEndWebhook:
-    """Webhook manager for async operations."""
-
-    def test_submit_job_returns_id_and_completes(self):
-        import time
-        from specllm.pipeline.webhook import WebhookManager
-
-        mgr = WebhookManager()
-        job_id = mgr.submit(lambda: {"result": "done"})
-
-        assert job_id is not None
-        time.sleep(0.1)
-        status = mgr.get_status(job_id)
-        assert status["status"] == "completed"
-        assert status["result"] == {"result": "done"}
-
-    def test_failed_job_reports_error(self):
-        import time
-        from specllm.pipeline.webhook import WebhookManager
-
-        mgr = WebhookManager()
-        job_id = mgr.submit(lambda: 1 / 0)
-
-        time.sleep(0.1)
-        status = mgr.get_status(job_id)
-        assert status["status"] == "failed"
 
 
 # --- Dynamic Constraints (x-constrain-from) Integration ---
