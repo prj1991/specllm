@@ -192,6 +192,8 @@ class CostTracker:
 class TestClient:
     """Test client for making requests without starting a server."""
 
+    __test__ = False  # Not a pytest test class
+
     def __init__(self, app: SpecLLM) -> None:
         self.app = app
 

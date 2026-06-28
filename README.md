@@ -79,12 +79,13 @@ Response ← [Cache Store] ← [Output Validation] ←──── Valid? ←─
 ```
 
 1. **Validate input** against your request schema — bad requests get instant 400, zero LLM cost
-2. **Check cache** — identical requests return cached responses
-3. **Build prompt** from your endpoint description + request body + response schema
-4. **Call LLM** with timeout enforcement and fallback provider support
-5. **Validate output** against your response schema
-6. **Retry with feedback** if output is invalid ("priority must be integer, you gave string")
-7. **Return guaranteed schema** or a structured error — nothing in between
+2. **Resolve constraints** — if `x-constrain-from` is in the response schema, pull allowed values from the request body
+3. **Check cache** — identical requests return cached responses
+4. **Build prompt** from your endpoint description + request body + constrained response schema
+5. **Call LLM** with timeout enforcement and fallback provider support
+6. **Validate output** against the constrained response schema
+7. **Retry with feedback** if output is invalid ("intent must be one of [billing, shipping]")
+8. **Return guaranteed schema** or a structured error — nothing in between
 
 ## Features
 
@@ -167,6 +168,63 @@ Schema validates structure. `@app.validate()` adds business rules — runs befor
 def only_enterprise(body):
     if body.get("customer_tier") != "enterprise":
         return "Only enterprise tickets accepted"
+```
+
+### Dynamic Response Constraints (`x-constrain-from`)
+
+Let the **caller** control what the LLM can return — per request. Add `x-constrain-from` to any response field and specllm will pull the allowed values from the request body at runtime:
+
+```yaml
+paths:
+  /v1/classify-intent:
+    post:
+      description: "Classify text into one of the caller-provided intents"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, intents]
+              properties:
+                text: { type: string }
+                intents:
+                  type: array
+                  items: { type: string }
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [intent, confidence]
+                properties:
+                  intent:
+                    type: string
+                    x-constrain-from: "intents"    # ← enum comes from request body
+                  confidence:
+                    type: number
+                    minimum: 0
+                    maximum: 1
+```
+
+Now each caller controls the output:
+
+```bash
+curl -X POST /v1/classify-intent \
+  -d '{"text": "I was charged twice", "intents": ["billing", "shipping", "cancellation"]}'
+# → {"intent": "billing", "confidence": 0.95}
+```
+
+If the LLM returns an intent not in the caller's list, specllm retries with feedback ("intent must be one of [billing, shipping, cancellation]") — up to 3 times.
+
+**Numeric ranges** work too:
+
+```yaml
+score:
+  type: integer
+  x-constrain-from:
+    minimum: "min_score"      # reads from request_body["min_score"]
+    maximum: "max_score"      # reads from request_body["max_score"]
 ```
 
 ### Custom Prompts
@@ -281,7 +339,7 @@ app = SpecLLM.from_openapi("./api.yaml", provider=my_provider, config={
 specllm (1,121 lines, zero required dependencies)
 
 ├── spec/         → OpenAPI parser + $ref resolution + JSON Schema validator
-├── pipeline/     → Request orchestration, cache, retry, webhook, cost tracking
+├── pipeline/     → Request orchestration, cache, retry, webhook, cost tracking, dynamic constraints
 ├── llm/          → Provider ABC + MockProvider
 ├── server/       → ThreadingHTTPServer + async server
 ├── prompts/      → Auto-prompt generation from endpoint specs
@@ -298,6 +356,7 @@ specllm (1,121 lines, zero required dependencies)
 - ✅ Provider abstraction + fallback chain + per-endpoint models
 - ✅ Thread-safe caching, timeout enforcement, cost limits
 - ✅ Async server, webhooks, record/replay testing
+- ✅ Dynamic response constraints (`x-constrain-from`)
 - ⬜ Built-in providers (Anthropic, OpenAI, Google, Ollama)
 - ⬜ Redis cache backend
 - ⬜ Prometheus metrics + OpenTelemetry tracing

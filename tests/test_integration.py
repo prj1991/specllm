@@ -396,7 +396,10 @@ class TestEndToEndHTTPServer:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status, json.loads(resp.read()), dict(resp.headers)
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read()), dict(e.headers)
+            try:
+                return e.code, json.loads(e.read()), dict(e.headers)
+            except (ConnectionResetError, OSError):
+                return e.code, {}, dict(e.headers)
 
     def test_full_http_request_returns_200(self):
         status, body, headers = self._post("/v1/route-ticket", {"title": "t", "body": "b"})
@@ -576,3 +579,112 @@ class TestEndToEndWebhook:
         time.sleep(0.1)
         status = mgr.get_status(job_id)
         assert status["status"] == "failed"
+
+
+# --- Dynamic Constraints (x-constrain-from) Integration ---
+
+CONSTRAINED_SPEC = {
+    "openapi": "3.0.0",
+    "info": {"title": "Constrained API", "version": "1.0"},
+    "paths": {
+        "/v1/classify-intent": {
+            "post": {
+                "description": "Classify text into one of the caller-provided intents.",
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["text", "intents"],
+                    "properties": {
+                        "text": {"type": "string"},
+                        "intents": {"type": "array", "items": {"type": "string"}},
+                    },
+                }}}},
+                "responses": {"200": {"content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["intent", "confidence"],
+                    "properties": {
+                        "intent": {"type": "string", "x-constrain-from": "intents"},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                }}}}},
+            }
+        },
+    },
+}
+
+
+class TestEndToEndDynamicConstraints:
+    """x-constrain-from: request body controls response validation."""
+
+    def test_valid_constrained_response(self):
+        provider = MockProvider(responses=[{"intent": "billing", "confidence": 0.95}])
+        app = SpecLLM(spec=CONSTRAINED_SPEC, provider=provider)
+        result = app.test_client().post("/v1/classify-intent", json_body={
+            "text": "I was charged twice",
+            "intents": ["billing", "shipping", "cancellation"],
+        })
+        assert result == {"intent": "billing", "confidence": 0.95}
+
+    def test_invalid_intent_triggers_retry_then_succeeds(self):
+        provider = MockProvider(responses=[
+            {"intent": "refund", "confidence": 0.7},      # not in caller's list
+            {"intent": "billing", "confidence": 0.85},    # valid
+        ])
+        app = SpecLLM(spec=CONSTRAINED_SPEC, provider=provider)
+        result = app.test_client().post("/v1/classify-intent", json_body={
+            "text": "wrong charge",
+            "intents": ["billing", "shipping"],
+        })
+        assert result == {"intent": "billing", "confidence": 0.85}
+        assert provider._call_count == 2
+
+    def test_retry_feedback_mentions_allowed_intents(self):
+        provider = MockProvider(responses=[
+            {"intent": "wrong", "confidence": 0.5},
+            {"intent": "billing", "confidence": 0.9},
+        ])
+        app = SpecLLM(spec=CONSTRAINED_SPEC, provider=provider)
+        app.test_client().post("/v1/classify-intent", json_body={
+            "text": "x",
+            "intents": ["billing", "shipping"],
+        })
+        # Second call includes feedback with the enum values
+        retry_prompt = provider._calls[1]["prompt"]
+        assert "billing" in retry_prompt
+        assert "shipping" in retry_prompt
+
+    def test_exhausted_retries_returns_422(self):
+        provider = MockProvider(responses=[{"intent": "invalid", "confidence": 0.5}])
+        app = SpecLLM(spec=CONSTRAINED_SPEC, provider=provider)
+        result = app.test_client().post("/v1/classify-intent", json_body={
+            "text": "test",
+            "intents": ["billing", "shipping"],
+        })
+        assert result["error"]["code"] == "OUTPUT_SCHEMA_VIOLATION"
+        assert result["error"]["status"] == 422
+
+    def test_constraint_prompt_shows_enum_to_llm(self):
+        provider = MockProvider(responses=[{"intent": "a", "confidence": 0.9}])
+        app = SpecLLM(spec=CONSTRAINED_SPEC, provider=provider)
+        app.test_client().post("/v1/classify-intent", json_body={
+            "text": "hello",
+            "intents": ["a", "b", "c"],
+        })
+        prompt = provider._calls[0]["prompt"]
+        # LLM prompt must show the constrained enum so it knows the options
+        assert '"a"' in prompt and '"b"' in prompt and '"c"' in prompt
+        assert "enum" in prompt
+
+    def test_different_callers_different_constraints(self):
+        """Two callers send different intent lists — each validated independently."""
+        provider = MockProvider(responses=[
+            {"intent": "dogs", "confidence": 0.8},
+            {"intent": "python", "confidence": 0.9},
+        ])
+        app = SpecLLM(spec=CONSTRAINED_SPEC, provider=provider)
+        client = app.test_client()
+
+        r1 = client.post("/v1/classify-intent", json_body={"text": "woof", "intents": ["dogs", "cats"]})
+        r2 = client.post("/v1/classify-intent", json_body={"text": "code", "intents": ["python", "java"]})
+
+        assert r1["intent"] == "dogs"
+        assert r2["intent"] == "python"

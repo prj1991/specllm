@@ -6,8 +6,16 @@ from typing import Optional
 from specllm.spec.parser import Endpoint
 
 
-def generate_prompt(endpoint: Endpoint, request_body: Optional[dict] = None) -> str:
-    """Generate a prompt from an endpoint spec and optional request body."""
+def generate_prompt(
+    endpoint: Endpoint,
+    request_body: Optional[dict] = None,
+    response_schema: Optional[dict] = None,
+) -> str:
+    """Generate a prompt from an endpoint spec and optional request body.
+
+    If response_schema is provided, it overrides endpoint.response_schema
+    (used for dynamic constraints).
+    """
     parts: list = []
 
     if endpoint.description:
@@ -17,8 +25,9 @@ def generate_prompt(endpoint: Endpoint, request_body: Optional[dict] = None) -> 
     parts.append("You must respond with valid JSON matching the following schema:")
     parts.append("")
 
-    if endpoint.response_schema:
-        parts.append(json.dumps(endpoint.response_schema, indent=2))
+    schema = response_schema or endpoint.response_schema
+    if schema:
+        parts.append(json.dumps(schema, indent=2))
 
     if request_body is not None:
         parts.append("")

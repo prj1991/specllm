@@ -1,16 +1,16 @@
 """Request pipeline - orchestrates the full request flow."""
 
 import json
-import time
 import uuid
 import concurrent.futures
 from typing import Callable, Dict, Optional
 
 from specllm.pipeline.cache import Cache
-from specllm.spec.validator import validate_schema
+from specllm.spec.validator import validate_schema, ValidationError
 from specllm.spec.parser import Endpoint
 from specllm.prompts.generator import generate_prompt
 from specllm.pipeline.retry import RetryHandler, MaxRetriesExceeded
+from specllm.pipeline.constraints import resolve_constraints
 from specllm.errors.codes import build_error_response, ErrorCode
 
 
@@ -59,19 +59,22 @@ class RequestPipeline:
             return {"__specllm_invalid__": True, "__raw__": str(result)[:500]}
         return result
 
-    def _try_fallback(self, prompt: str, validate_fn: Callable, cache_key: str, call_count: int) -> Optional[dict]:
-        """Attempt fallback provider. Returns valid result or None."""
-        if not self.fallback_provider:
-            return None
-        try:
-            result = self._call_provider(self.fallback_provider, prompt)
-            if not validate_fn(result):
-                self.last_metadata["retries"] = call_count
-                self.cache.set(cache_key, result)
-                return result
-        except Exception:
-            pass
-        return None
+    def _handle_failure(
+        self, code: ErrorCode, message: str,
+        prompt: str, validate_fn: Callable, cache_key: str, call_count: int, request_id: str,
+    ) -> dict:
+        """Try fallback, otherwise return structured error."""
+        if self.fallback_provider:
+            try:
+                result = self._call_provider(self.fallback_provider, prompt)
+                if not validate_fn(result):
+                    self.last_metadata["retries"] = call_count
+                    self.cache.set(cache_key, result)
+                    return result
+            except Exception:
+                pass
+        self.last_metadata["retries"] = max(0, call_count - 1)
+        return build_error_response(code, message=message, request_id=request_id)
 
     def handle(self, endpoint: Endpoint, request_body: dict) -> dict:
         """Handle a request through the full pipeline."""
@@ -107,6 +110,9 @@ class RequestPipeline:
                     request_id=request_id,
                 )
 
+        # Apply dynamic constraints from request body (x-constrain-from in spec)
+        constrained_response_schema = resolve_constraints(endpoint.response_schema, request_body)
+
         # Check cache
         cache_key = self.cache.generate_key(endpoint.path, endpoint.method, request_body)
         cached = self.cache.get(cache_key)
@@ -119,7 +125,7 @@ class RequestPipeline:
         if custom_prompt_fn:
             prompt = custom_prompt_fn(request_body)
         else:
-            prompt = generate_prompt(endpoint, request_body)
+            prompt = generate_prompt(endpoint, request_body, constrained_response_schema)
 
         # Determine which provider to use (per-endpoint model override)
         active_provider = self.provider
@@ -137,48 +143,30 @@ class RequestPipeline:
 
         def validate_fn(result: dict) -> list:
             if result.get("__specllm_invalid__"):
-                from specllm.spec.validator import ValidationError
-
-                return [
-                    ValidationError(
-                        path=".", message="Response must be a JSON object. Got non-JSON output from provider."
-                    )
-                ]
-            if endpoint.response_schema:
-                return validate_schema(result, endpoint.response_schema)
+                return [ValidationError(
+                    path=".", message="Response must be a JSON object. Got non-JSON output from provider."
+                )]
+            if constrained_response_schema:
+                return validate_schema(result, constrained_response_schema)
             return []
 
         try:
             result = self.retry_handler.execute(call_fn, validate_fn)
         except MaxRetriesExceeded:
-            fallback_result = self._try_fallback(prompt, validate_fn, cache_key, call_count)
-            if fallback_result is not None:
-                return fallback_result
-            self.last_metadata["retries"] = call_count - 1
-            return build_error_response(
+            return self._handle_failure(
                 ErrorCode.OUTPUT_SCHEMA_VIOLATION,
-                message="LLM output failed schema validation after all retries",
-                request_id=request_id,
+                "LLM output failed schema validation after all retries",
+                prompt, validate_fn, cache_key, call_count, request_id,
             )
         except TimeoutError as e:
-            fallback_result = self._try_fallback(prompt, validate_fn, cache_key, call_count)
-            if fallback_result is not None:
-                return fallback_result
-            self.last_metadata["retries"] = max(0, call_count - 1)
-            return build_error_response(
-                ErrorCode.PROVIDER_TIMEOUT,
-                message=str(e),
-                request_id=request_id,
+            return self._handle_failure(
+                ErrorCode.PROVIDER_TIMEOUT, str(e),
+                prompt, validate_fn, cache_key, call_count, request_id,
             )
         except Exception as e:
-            fallback_result = self._try_fallback(prompt, validate_fn, cache_key, call_count)
-            if fallback_result is not None:
-                return fallback_result
-            self.last_metadata["retries"] = max(0, call_count - 1)
-            return build_error_response(
-                ErrorCode.PROVIDER_UNAVAILABLE,
-                message=f"LLM provider error: {str(e)}",
-                request_id=request_id,
+            return self._handle_failure(
+                ErrorCode.PROVIDER_UNAVAILABLE, f"LLM provider error: {e}",
+                prompt, validate_fn, cache_key, call_count, request_id,
             )
 
         self.last_metadata["retries"] = max(0, call_count - 1)
