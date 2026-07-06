@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import re
 import uuid
 import concurrent.futures
 from typing import Callable, Dict, Optional
@@ -45,6 +46,24 @@ def _build_prompt(endpoint: Endpoint, request_body: dict, response_schema: Optio
     if request_body:
         parts.append(f"\nRequest body:\n{json.dumps(request_body, indent=2)}")
     return "\n".join(parts)
+
+
+# --- JSON extraction from LLM text ---
+
+def _parse_json(text: str) -> dict:
+    """Extract JSON from LLM text response. Handles markdown fences and bare JSON."""
+    # Strip markdown code fences: ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if match:
+        text = match.group(1)
+    text = text.strip()
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return {"__specllm_invalid__": True}
 
 
 # --- Retry with feedback ---
@@ -103,9 +122,11 @@ class RequestPipeline:
                 result = ex.submit(provider.call, prompt).result(timeout=self.timeout_seconds)
             except concurrent.futures.TimeoutError:
                 raise TimeoutError(f"LLM call timed out after {self.timeout_seconds}s")
-        if not isinstance(result, dict):
-            return {"__specllm_invalid__": True}
-        return result
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            return _parse_json(result)
+        return {"__specllm_invalid__": True}
 
     def _try_fallback(self, prompt: str, validate_fn: Callable, cache_key: str) -> Optional[dict]:
         if not self.fallback_provider:

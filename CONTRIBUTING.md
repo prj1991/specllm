@@ -1,59 +1,82 @@
 # Contributing to specllm
 
-## Coding Guidelines
+## Design Philosophy
 
-These guidelines exist to keep the codebase minimal and maintainable. Every line is tech debt.
+**Make it as simple as possible for users.** Every decision starts here. If a feature requires boilerplate, understanding internals, or configuring something that could be inferred — the design is wrong.
 
-### 1. No single-function modules
+**Less code is better code.** Every line is debt. A feature that makes the codebase smaller is better than one that makes it larger. Before adding, ask: can I delete something instead?
 
-If a module contains only one function or class, inline it into its consumer. A new file must justify its existence with distinct, non-trivial logic that would clutter its consumer.
+The ideal experience: write an OpenAPI spec, run one line of Python, get a working LLM-powered API.
 
-### 2. No aspirational code
+## Principles
 
-Don't add code for features that don't exist yet. No unused error codes, unused parameters, unused classes, or unused fields. Add them when they're needed, not before.
+### How we design
 
-### 3. One mechanism per concept
+**1. Start from the user's pain, not the technical solution.**
+Before writing code, describe what the user currently suffers through. Then find the smallest change that eliminates that pain.
 
-If there are two ways to do the same thing (e.g., a decorator AND a spec annotation for the same feature), pick one. The spec-declarative approach (`x-constrain-from`) wins over programmatic decorators when both are possible.
+**2. The spec is the single source of truth.**
+All configuration lives in the OpenAPI spec via `x-specllm-*` fields. Python arguments exist only as overrides. If it can be in the spec, it must be.
 
-### 4. Tests must not duplicate coverage
+**3. Flexibility belongs at the API level.**
+When users need control (which model, which constraints), express it in the spec — not in application code. The spec is what they already write. Meet them there.
 
-Before adding a test file, check if the behavior is already tested through `test_integration.py`. Unit tests are only justified for:
-- Complex pure functions with many edge cases (validator, parser)
-- Logic that's hard to reach through the integration path
+**4. Infer, don't ask.**
+If information can be derived, don't make the user provide it. The model name tells you the provider. The request body tells you the constraints.
 
-Never create a separate test file for a feature that's fully exercised by integration tests.
+**5. One mechanism per concept.**
+If there are two ways to do the same thing, pick one. Spec-declarative wins over programmatic.
 
-### 5. Every stored field must have a reader
+### How we code
 
-If `self.x = value` is written in `__init__`, something must read `self.x` after construction. If it's only used during init, use a local variable instead.
+**6. Every line must justify its existence.**
+After building a feature, go through every line and ask: what breaks if I delete this? If nothing breaks — delete it.
 
-### 6. The server must use the app's pipeline
+**7. No aspirational code.**
+Don't add parameters, classes, fields, or error codes for features that don't exist yet. Add them the day they're needed.
 
-Never re-parse specs or create a separate pipeline in server code. The server receives the `SpecLLM` app instance and calls `app._pipeline.handle()` directly. This ensures decorators, cost limits, and fallback providers work identically in test and HTTP mode.
+**8. No single-function modules.**
+If a module contains one function, inline it into its consumer. A new file needs distinct, non-trivial logic.
 
-### 7. README: show, don't repeat
+**9. Shared logic belongs in one place.**
+If three code paths do the same thing, extract a helper. Copy-paste is a design failure.
 
-Each concept gets ONE code example. If the same idea (e.g., "schema validation works") is shown in the architecture diagram, the feature list, AND a full YAML example — cut two of them.
+**10. Every stored field must have a reader.**
+If `self.x` is only used during `__init__`, use a local variable.
 
-### 8. Shared logic belongs in one place
+**11. Dependencies: zero required.**
+stdlib only. Optional deps (PyYAML, anthropic, openai) gated behind try/except with install instructions.
 
-If three code paths do the same thing with different parameters, extract a helper. The error handling pattern (try fallback → set metadata → return error) is one function, not three copy-pasted blocks.
+### How we test
 
-### 9. Dependencies: zero required
+**12. Integration tests are the source of truth.**
+Before adding a test file, check if `test_integration.py` already covers the behavior. Separate unit tests only for complex pure functions (validator, parser).
 
-The library uses only Python stdlib. Optional dependencies (PyYAML) are gated behind try/except with clear install instructions in the error message.
+**13. Never duplicate test coverage.**
+If test A already proves a behavior, don't write test B that proves the same thing with a different spec shape. Each test must prove exactly one thing no other test covers.
 
-### 10. Structure mirrors the execution flow
+**14. Validate at the boundary.**
+Mock external SDKs at the SDK boundary (not our code). This exercises our full stack while isolating from network/credentials.
+
+### How we ship
+
+**15. The server must use the app's pipeline.**
+Never re-parse or create separate pipelines in server code. `app._pipeline.handle()` is the single path. Decorators, cost limits, fallback — all work identically in test and HTTP mode.
+
+**16. README: show each concept once.**
+One code example per idea. If it's shown in the diagram AND a YAML block AND an explanation — cut two.
+
+**17. Iterate until you can't remove more.**
+After a feature is "done," review it 10 times asking "can this be simpler?" Ship when the answer is finally no.
+
+## Structure
 
 ```
 specllm/
 ├── __init__.py       → Entry point (SpecLLM, TestClient, CostTracker)
 ├── spec/             → Parse + validate (pure functions, no I/O)
 ├── pipeline/         → Runtime orchestration (cache, constraints, request handling)
-├── llm/              → Provider abstraction
+├── llm/              → Provider abstraction (Anthropic, OpenAI, Mock)
 ├── server/           → HTTP serving (optional, lazy-imported)
-└── testing/          → Test utilities (optional)
+└── testing/          → Test utilities (optional, lazy-imported)
 ```
-
-Packages that are lazy-imported (`server/`, `testing/`) don't load at `import specllm` time.

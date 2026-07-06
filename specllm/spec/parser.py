@@ -14,6 +14,7 @@ class Endpoint:
     description: str
     request_schema: Optional[Dict] = None
     response_schema: Optional[Dict] = None
+    model: Optional[str] = None
 
 
 def _resolve_refs(schema: Any, root_spec: dict) -> Any:
@@ -84,6 +85,7 @@ def parse_openapi_spec(spec: dict) -> List[Endpoint]:
                     description=description,
                     request_schema=request_schema,
                     response_schema=response_schema,
+                    model=operation.get("x-specllm-model"),
                 )
             )
 

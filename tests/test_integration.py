@@ -662,3 +662,122 @@ class TestEndToEndDynamicConstraints:
 
         assert r1["intent"] == "dogs"
         assert r2["intent"] == "python"
+
+
+
+# --- x-specllm-model: spec-driven provider/model selection ---
+
+class TestSpecDrivenModel:
+    """x-specllm-model in spec controls provider and per-endpoint model."""
+
+    def test_endpoint_model_override_from_spec(self):
+        """x-specllm-model on an endpoint becomes the model for that endpoint."""
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "T", "version": "1"},
+            "paths": {
+                "/fast": {
+                    "post": {
+                        "x-specllm-model": "haiku",
+                        "description": "Fast endpoint",
+                        "requestBody": {"content": {"application/json": {"schema": {
+                            "type": "object", "properties": {"text": {"type": "string"}},
+                        }}}},
+                        "responses": {"200": {"content": {"application/json": {"schema": {
+                            "type": "object", "properties": {"result": {"type": "string"}},
+                        }}}}},
+                    }
+                }
+            },
+        }
+        from unittest.mock import Mock
+        provider = Mock()
+        provider.call = Mock(return_value={"result": "ok"})
+        provider.with_model = Mock(return_value=provider)
+
+        app = SpecLLM(spec=spec, provider=provider)
+        app.test_client().post("/fast", json_body={"text": "hi"})
+
+        provider.with_model.assert_called_once_with("haiku")
+
+    def test_spec_level_model_auto_creates_provider(self):
+        """x-specllm-model in info creates provider automatically (when SDK available)."""
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "T", "version": "1", "x-specllm-model": "claude-sonnet-4-20250514"},
+            "paths": {
+                "/test": {
+                    "post": {
+                        "description": "Test",
+                        "responses": {"200": {"content": {"application/json": {"schema": {
+                            "type": "object", "properties": {"x": {"type": "string"}},
+                        }}}}},
+                    }
+                }
+            },
+        }
+        # This will try to import anthropic — if not installed, it should raise ImportError
+        try:
+            app = SpecLLM(spec=spec)
+            # If anthropic is installed, provider should be created
+            assert app.provider is not None
+        except ImportError as e:
+            assert "specllm[anthropic]" in str(e)
+
+    def test_explicit_provider_overrides_spec(self):
+        """If provider= is passed, x-specllm-model in spec is ignored for provider creation."""
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "T", "version": "1", "x-specllm-model": "claude-sonnet-4-20250514"},
+            "paths": {
+                "/test": {"post": {
+                    "description": "Test",
+                    "responses": {"200": {"content": {"application/json": {"schema": {
+                        "type": "object", "properties": {"x": {"type": "string"}},
+                    }}}}},
+                }}
+            },
+        }
+        provider = MockProvider(responses=[{"x": "hello"}])
+        app = SpecLLM(spec=spec, provider=provider)
+        assert app.provider is provider
+
+
+# --- JSON extraction from string responses ---
+
+class TestStringResponseParsing:
+    """Pipeline handles providers that return strings instead of dicts."""
+
+    def test_valid_json_string(self):
+        """Provider returns a JSON string — pipeline parses it."""
+        from unittest.mock import Mock
+        provider = Mock()
+        provider.call = Mock(return_value='{"team": "billing", "priority": 2}')
+
+        app = SpecLLM(spec=SPEC, provider=provider)
+        result = app.test_client().post("/v1/route-ticket", json_body={"title": "t", "body": "b"})
+        assert result == {"team": "billing", "priority": 2}
+
+    def test_json_in_markdown_fences(self):
+        """Provider returns JSON wrapped in ```json ... ``` — pipeline extracts it."""
+        from unittest.mock import Mock
+        provider = Mock()
+        provider.call = Mock(return_value='```json\n{"team": "support", "priority": 1}\n```')
+
+        app = SpecLLM(spec=SPEC, provider=provider)
+        result = app.test_client().post("/v1/route-ticket", json_body={"title": "t", "body": "b"})
+        assert result == {"team": "support", "priority": 1}
+
+    def test_invalid_string_triggers_retry(self):
+        """Provider returns non-JSON string — triggers retry."""
+        from unittest.mock import Mock
+        provider = Mock()
+        provider.call = Mock(side_effect=[
+            "I think the answer is billing",  # not JSON
+            '{"team": "billing", "priority": 3}',  # valid JSON
+        ])
+
+        app = SpecLLM(spec=SPEC, provider=provider)
+        result = app.test_client().post("/v1/route-ticket", json_body={"title": "t", "body": "b"})
+        assert result == {"team": "billing", "priority": 3}
+        assert provider.call.call_count == 2

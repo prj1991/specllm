@@ -14,7 +14,7 @@ Define a REST API spec. specllm turns it into a live service where every respons
 ```python
 from specllm import SpecLLM
 
-app = SpecLLM.from_openapi("./api.yaml", provider=my_provider)
+app = SpecLLM.from_openapi("./api.yaml")  # provider inferred from spec
 app.serve(port=8080)
 ```
 
@@ -22,7 +22,8 @@ app.serve(port=8080)
 
 ```bash
 pip install specllm
-pip install specllm[yaml]  # optional, for YAML specs
+pip install specllm[anthropic]  # for Claude
+pip install specllm[openai]     # for GPT-4
 ```
 
 ## How It Works
@@ -45,14 +46,26 @@ Bad input → instant 400 (zero LLM cost). Invalid output → retry with error f
 
 Write a spec with request/response schemas. specllm generates prompts, validates LLM output, retries on failure. No glue code.
 
-### Provider-Agnostic
+### Model Selection via Spec
 
-Implement one method. Swap models without changing your API contract:
+Specify the model in your spec. specllm infers the provider:
+
+```yaml
+info:
+  x-specllm-model: claude-sonnet-4-20250514   # default for all endpoints
+
+paths:
+  /v1/fast-route:
+    post:
+      x-specllm-model: claude-haiku-4          # override: cheap/fast
+```
+
+Built-in providers: Anthropic (`claude-*`) and OpenAI (`gpt-*`, `o1-*`, `o3-*`). Custom providers just implement one method:
 
 ```python
 class MyProvider(LLMProvider):
-    def call(self, prompt: str, system_prompt=None) -> dict:
-        ...
+    def call(self, prompt: str, system_prompt=None) -> str:
+        ...  # return raw text or dict — pipeline handles JSON extraction
 ```
 
 ### Dynamic Response Constraints (`x-constrain-from`)
@@ -73,13 +86,12 @@ score:
 
 If the LLM picks outside the caller's options, specllm retries with feedback automatically.
 
-### Configuration
+### Configuration (optional overrides)
 
 ```python
-app = SpecLLM.from_openapi("./api.yaml", provider=my_provider, config={
+app = SpecLLM.from_openapi("./api.yaml", config={
     "timeout_seconds": 30,
     "fallback_provider": backup_provider,
-    "endpoint_models": {"/v1/simple": "haiku", "/v1/complex": "sonnet"},
     "cost_limit_daily": 50.0,
     "cache_ttl": 3600,
 })
@@ -128,13 +140,10 @@ All errors return structured JSON with `code`, `status`, `message`, `request_id`
 specllm (zero required dependencies)
 
 ├── spec/         → OpenAPI parser + $ref resolution + JSON Schema validator
-├── pipeline/     → Request orchestration, cache, retry, constraints, cost tracking
-├── llm/          → Provider ABC + MockProvider
+├── pipeline/     → Request orchestration, cache, retry, constraints, JSON extraction
+├── llm/          → Provider ABC + Anthropic + OpenAI + MockProvider
 ├── server/       → ThreadingHTTPServer + async server
-├── prompts/      → Auto-prompt generation from endpoint specs
-├── errors/       → Structured error codes + HTTP status mapping
-├── observability/ → Response headers
-└── testing/      → Contract tests + record/replay
+└── testing/      → Record/replay
 ```
 
 ## Roadmap
@@ -145,7 +154,7 @@ specllm (zero required dependencies)
 - ✅ Caching, timeout enforcement, cost limits, async server, webhooks
 - ✅ Dynamic response constraints (`x-constrain-from`)
 - ✅ Record/replay testing
-- ⬜ Built-in providers (Anthropic, OpenAI, Google, Ollama)
+- ✅ Built-in providers (Anthropic, OpenAI) with spec-driven model selection
 - ⬜ Redis cache backend
 - ⬜ Prometheus metrics + OpenTelemetry tracing
 

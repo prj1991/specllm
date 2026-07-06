@@ -30,6 +30,8 @@ Homepage = "https://github.com/prj1991/specllm"
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
+anthropic = ["anthropic>=0.40.0"]
+openai = ["openai>=1.0.0"]
 
 [tool.setuptools.packages.find]
 include = ["specllm*"]

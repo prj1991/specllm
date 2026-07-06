@@ -26,13 +26,26 @@ class SpecLLM:
         self._custom_validators: Dict[tuple, Callable] = {}
         self._pipeline: Optional[RequestPipeline] = None
 
-        if provider is not None and isinstance(provider, str):
+        # Auto-create provider from spec if not passed explicitly
+        if provider is None:
+            model = spec.get("info", {}).get("x-specllm-model")
+            if model:
+                from specllm.llm.providers import create_provider
+                provider = create_provider(model)
+        elif isinstance(provider, str):
             raise TypeError(
                 f"provider must be an LLMProvider instance, got string '{provider}'. "
                 f"Use a provider class like MockProvider or implement LLMProvider."
             )
+
         self.provider = provider
         self.fallback_provider = self.config.get("fallback_provider")
+
+        # Per-endpoint model overrides from spec
+        endpoint_models = self.config.get("endpoint_models") or {}
+        for ep in self.endpoints:
+            if ep.model:
+                endpoint_models.setdefault(ep.path, ep.model)
 
         self._cost_tracker = CostTracker(
             daily_limit=self.config.get("cost_limit_daily"),
@@ -47,7 +60,7 @@ class SpecLLM:
                 custom_validators=self._custom_validators,
                 timeout_seconds=self.config.get("timeout_seconds", 30),
                 cost_tracker=self._cost_tracker,
-                endpoint_models=self.config.get("endpoint_models"),
+                endpoint_models=endpoint_models,
             )
 
     @classmethod
