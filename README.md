@@ -42,10 +42,6 @@ Bad input → instant 400 (zero LLM cost). Invalid output → retry with error f
 
 ## Features
 
-### Your OpenAPI spec is the implementation
-
-Write a spec with request/response schemas. specllm generates prompts, validates LLM output, retries on failure. No glue code.
-
 ### Model Selection via Spec
 
 Specify the model in your spec. specllm infers the provider:
@@ -105,9 +101,13 @@ def only_enterprise(body):
     if body.get("customer_tier") != "enterprise":
         return "Only enterprise tickets accepted"
 
-@app.prompt("/v1/moderate")
-def moderate_prompt(body):
-    return f"Evaluate against community guidelines:\n{body['text']}"
+@app.prompt("/v1/answer")
+def grounded_prompt(body):
+    return (
+        f"Answer ONLY from the following context. If the answer is not in the context, say so.\n\n"
+        f"Context:\n{body['context']}\n\n"
+        f"Question: {body['question']}"
+    )
 ```
 
 ### Observability
@@ -148,13 +148,6 @@ specllm (zero required dependencies)
 
 ## Roadmap
 
-- ✅ OpenAPI parsing (JSON + YAML) with $ref resolution
-- ✅ Schema validation + retry with error feedback
-- ✅ Custom validation, prompts, provider fallback, per-endpoint models
-- ✅ Caching, timeout enforcement, cost limits, async server, webhooks
-- ✅ Dynamic response constraints (`x-constrain-from`)
-- ✅ Record/replay testing
-- ✅ Built-in providers (Anthropic, OpenAI) with spec-driven model selection
 - ⬜ Redis cache backend
 - ⬜ Prometheus metrics + OpenTelemetry tracing
 
