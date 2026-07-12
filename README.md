@@ -1,14 +1,32 @@
 # specllm
 
-**The production framework for spec-first LLM APIs.**
+[![PyPI](https://img.shields.io/pypi/v/specllm)](https://pypi.org/project/specllm/)
+[![Python](https://img.shields.io/pypi/pyversions/specllm)](https://pypi.org/project/specllm/)
+[![License](https://img.shields.io/github/license/prj1991/specllm)](LICENSE)
 
-Define a REST API spec. specllm turns it into a live service where every response is powered by an LLM — validated, cached, and retried automatically. The caller never knows an LLM is involved.
+**Makes any LLM behave like a regular REST API.** Define the contract, specllm enforces it. The caller never knows an LLM is involved.
 
+Every team shipping LLMs into production rebuilds the same layer: validation, retries, caching, error handling. specllm handles all of it from your API spec.
+
+```mermaid
+flowchart LR
+    A[Your App] -->|Request JSON| B[specllm]
+    B -->|Prompt| C[Any LLM]
+    C -->|Response| B
+    B -->|Validated JSON| A
 ```
-┌──────────┐       ┌─────────────────────────────────────┐       ┌─────────┐
-│ Your App │──────▶│ specllm                             │──────▶│   LLM   │
-│          │◀──────│ (validates, retries, caches, serves)│◀──────│(any LLM)│
-└──────────┘ JSON  └─────────────────────────────────────┘ JSON  └─────────┘
+
+## Quick Start
+
+```bash
+pip install specllm
+python -m specllm.demo   # runs locally, no API key needed
+```
+
+Or with a real LLM:
+
+```bash
+pip install specllm[anthropic]
 ```
 
 ```python
@@ -18,33 +36,18 @@ app = SpecLLM.from_openapi("./api.yaml")  # provider inferred from spec
 app.serve(port=8080)
 ```
 
-## Install
+Your spec declares the model:
 
-```bash
-pip install specllm
-pip install specllm[anthropic]  # for Claude
-pip install specllm[openai]     # for GPT-4
+```yaml
+info:
+  x-specllm-model: claude-sonnet-4-20250514
 ```
 
-## How It Works
-
-```
-Request → [Input Validation] → [Resolve Constraints] → [Cache Check] → [Build Prompt] → [Call LLM]
-                                                                                              ↓
-Response ← [Cache Store] ← [Output Validation] ←──── Valid? ←──── [LLM Response]
-                                                       ↓ No
-                                              [Retry with feedback] (up to 3x)
-                                                       ↓ Still invalid
-                                              [422 structured error]
-```
-
-Bad input → instant 400 (zero LLM cost). Invalid output → retry with error feedback. Still invalid → structured 422. Valid → cache and return.
+That's it. No provider class, no config.
 
 ## Features
 
 ### Model Selection via Spec
-
-Specify the model in your spec. specllm infers the provider:
 
 ```yaml
 info:
@@ -82,17 +85,6 @@ score:
 
 If the LLM picks outside the caller's options, specllm retries with feedback automatically.
 
-### Configuration (optional overrides)
-
-```python
-app = SpecLLM.from_openapi("./api.yaml", config={
-    "timeout_seconds": 30,
-    "fallback_provider": backup_provider,
-    "cost_limit_daily": 50.0,
-    "cache_ttl": 3600,
-})
-```
-
 ### Custom Validation & Prompts
 
 ```python
@@ -110,6 +102,17 @@ def grounded_prompt(body):
     )
 ```
 
+### Configuration (optional overrides)
+
+```python
+app = SpecLLM.from_openapi("./api.yaml", config={
+    "timeout_seconds": 30,
+    "fallback_provider": backup_provider,
+    "cost_limit_daily": 50.0,
+    "cache_ttl": 3600,
+})
+```
+
 ### Observability
 
 Every response includes headers: `X-SpecLLM-Request-Id`, `X-SpecLLM-Latency-Ms`, `X-SpecLLM-Tokens-Used`, `X-SpecLLM-Retries`, `X-SpecLLM-Cache-Hit`.
@@ -123,6 +126,23 @@ from specllm.testing.record_replay import RecordReplayProvider
 provider = RecordReplayProvider(provider=real_provider, cassette="tests/tape.json")
 ```
 
+## How It Works
+
+```mermaid
+flowchart TD
+    A[Request] --> B[Validate Input]
+    B -->|Invalid| C[400 Error]
+    B -->|Valid| D[Resolve Constraints]
+    D --> E{Cache Hit?}
+    E -->|Yes| F[Return Cached]
+    E -->|No| G[Build Prompt & Call LLM]
+    G --> H{Valid Output?}
+    H -->|Yes| I[Cache & Return]
+    H -->|No| J[Retry with Feedback]
+    J -->|Success| I
+    J -->|3x Failed| K[422 Error]
+```
+
 ## Error Handling
 
 | Scenario | HTTP | Code |
@@ -133,23 +153,6 @@ provider = RecordReplayProvider(provider=real_provider, cassette="tests/tape.jso
 | Cost limit hit | 503 | `COST_LIMIT_REACHED` |
 
 All errors return structured JSON with `code`, `status`, `message`, `request_id`, `timestamp`.
-
-## Architecture
-
-```
-specllm (zero required dependencies)
-
-├── spec/         → OpenAPI parser + $ref resolution + JSON Schema validator
-├── pipeline/     → Request orchestration, cache, retry, constraints, JSON extraction
-├── llm/          → Provider ABC + Anthropic + OpenAI + MockProvider
-├── server/       → ThreadingHTTPServer + async server
-└── testing/      → Record/replay
-```
-
-## Roadmap
-
-- ⬜ Redis cache backend
-- ⬜ Prometheus metrics + OpenTelemetry tracing
 
 ## License
 
